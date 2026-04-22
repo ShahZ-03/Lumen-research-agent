@@ -1,0 +1,1 @@
+{"job_id": "58eeb2c1-6d05-4aa3-bb57-009ca44a85d5", "topic": "test topic", "status": "processing", "step": "embedding", "iteration": 0, "report": null, "error": null, "timings": {"decompose_seconds": 0.001, "search_round_0_seconds": 0.0, "score_round_0_seconds": 0.0}}

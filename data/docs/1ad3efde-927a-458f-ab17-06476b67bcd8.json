@@ -1,0 +1,1 @@
+{"job_id": "1ad3efde-927a-458f-ab17-06476b67bcd8", "topic": "string", "status": "processing", "step": "scoring", "iteration": 0, "report": null, "error": null, "timings": {"decompose_seconds": 1.27, "search_round_0_seconds": 1.902}, "source_domains_count": null, "grounding": null, "created_at": "2026-04-21T17:31:46.008536+00:00", "updated_at": "2026-04-21T17:32:05.614482+00:00"}
