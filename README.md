@@ -14,6 +14,19 @@ Lumen is an asynchronous research web app that:
 
 This document explains the architecture, backend control flow, async design, fallback/retry behavior, and rate-limit protections in detail.
 
+## Screenshots
+
+Here are some screenshots of the Lumen Research Agent app:
+
+![App Screenshot 1](assets/LM1.png)
+![App Screenshot 2](assets/LM2.png)
+![App Screenshot 3](assets/LM4.png)
+![App Screenshot 4](assets/LM5.png)
+
+## Demo
+
+![Demo GIF](assets/Lumenresearchagent-ezgif.com-video-to-gif-converter.gif)
+
 ## Prerequisites / Quickstart
 
 ### Prerequisites
@@ -121,6 +134,10 @@ npm run dev
 
 - `GET /jobs`
   - returns history list from SQLite (`job_id`, `topic`, timestamps, status)
+
+- `GET /debug/synthesis/{job_id}`
+  - returns retrieval/synthesis debug snapshot for troubleshooting quality
+  - includes retrieved chunk snippets, chunks actually used in prompt, and selected provider/model
 
 - `DELETE /jobs/{job_id}`
   - removes job from SQLite + optional Redis + in-memory stores
@@ -369,6 +386,10 @@ See `.env.example` for the full list. The most important non-obvious knobs are:
 - `VECTORIZATION_BATCH_SIZE`: number of chunks embedded per insertion batch
 - `DB_PATH`: optional SQLite location (default `data/lumen.db`)
 - `GROUNDING_THRESHOLD`: cosine-similarity threshold for claim verification
+- `SYNTHESIS_PROVIDER`: `groq` (default) or `gemini`
+- `GROQ_MODEL`: overrides Groq synthesis model (default `llama-3.3-70b-versatile`)
+- `GEMINI_MODEL`: overrides Gemini model (default `gemini-1.5-flash`; can be `gemini-2.5-flash`)
+- `MAX_SYNTHESIS_CHUNKS`: cap prompt chunks used by synthesis (default `8`)
 
 ## Local Development
 
