@@ -22,7 +22,7 @@ User Interface:
 
 ## Demo
 
-![Demo GIF](assets/Lumenresearchagent-ezgif.com-video-to-gif-converter%20(1).gif)
+![Demo GIF](assets/Lumenresearchagent-ezgif.com-video-to-gif-converter%20(2).gif)
 
 ## Prerequisites / Quickstart
 
