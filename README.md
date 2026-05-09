@@ -16,12 +16,9 @@ This document explains the architecture, backend control flow, async design, fal
 
 ## Screenshots
 
-Here are some screenshots of the Lumen Research Agent app:
+User Interface:
 
 ![App Screenshot 1](assets/LM1.png)
-![App Screenshot 2](assets/LM2.png)
-![App Screenshot 3](assets/LM4.png)
-![App Screenshot 4](assets/LM5.png)
 
 ## Demo
 

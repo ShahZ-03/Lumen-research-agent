@@ -1,5 +1,6 @@
 # backend/main.py — FastAPI research API
 import uuid
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,9 +17,22 @@ logger = services.get_logger()
 
 app = FastAPI(title="Research Agent API")
 
+
+def _parse_allowed_origins() -> list[str]:
+    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+    if not raw:
+        # Safe local defaults for development.
+        return ["http://localhost:8080", "http://127.0.0.1:8080"]
+    origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+    # Never allow wildcard when credentials are enabled.
+    return [o for o in origins if o != "*"]
+
+
+allowed_origins = _parse_allowed_origins()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -86,6 +100,14 @@ async def list_research_jobs():
         except Exception:
             continue
     return out
+
+
+@app.get("/debug/synthesis/{job_id}")
+async def synthesis_debug(job_id: str):
+    info = services.get_synthesis_debug(job_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="debug snapshot not found for job_id")
+    return info
 
 
 @app.delete("/jobs/{job_id}")

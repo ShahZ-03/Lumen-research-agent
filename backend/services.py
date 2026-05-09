@@ -5,10 +5,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 try:
     import redis.asyncio as redis
@@ -41,6 +43,7 @@ LEGACY_DOCS_DIR = Path("data/docs")
 # Per-job lexical corpus (aligns with metadata chunk_index on each row)
 JOB_CORPUS: dict[str, list[str]] = {}
 JOB_CHUNK_META: dict[str, list[dict]] = {}
+SYNTHESIS_DEBUG: dict[str, dict[str, Any]] = {}
 
 report_stream_queues: dict[str, asyncio.Queue[str | None]] = {}
 _db_lock = asyncio.Lock()
@@ -49,6 +52,74 @@ _db_initialized = False
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_SENSITIVE_QUERY_KEYS = {
+    "key",
+    "api_key",
+    "apikey",
+    "token",
+    "access_token",
+    "refresh_token",
+    "authorization",
+    "password",
+    "secret",
+}
+
+
+def _redact_sensitive_url_query(text: str) -> str:
+    """Redact secret-like query params in URLs embedded in text."""
+    if "?" not in text:
+        return text
+    parts = text.split()
+    redacted_parts: list[str] = []
+    for part in parts:
+        if "?" not in part or "://" not in part:
+            redacted_parts.append(part)
+            continue
+        try:
+            split = urlsplit(part)
+            if not split.query:
+                redacted_parts.append(part)
+                continue
+            query = parse_qsl(split.query, keep_blank_values=True)
+            updated = []
+            changed = False
+            for k, v in query:
+                if k.lower() in _SENSITIVE_QUERY_KEYS:
+                    updated.append((k, "***REDACTED***"))
+                    changed = True
+                else:
+                    updated.append((k, v))
+            if not changed:
+                redacted_parts.append(part)
+                continue
+            new_query = urlencode(updated, doseq=True)
+            redacted_parts.append(urlunsplit(split._replace(query=new_query)))
+        except Exception:
+            redacted_parts.append(part)
+    return " ".join(redacted_parts)
+
+
+def sanitize_error_message(value: Any) -> Optional[str]:
+    """Normalize and redact sensitive tokens before persisting error text."""
+    if value is None:
+        return None
+    text = str(value)
+    text = _redact_sensitive_url_query(text)
+    # Common auth header / token shapes that can leak in exception strings.
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+", r"\1***REDACTED***", text)
+    text = re.sub(r"(?i)\b(api[_-]?key|token|password|secret)\s*[:=]\s*([^\s,;]+)", r"\1=***REDACTED***", text)
+    return text
+
+
+def _scrub_existing_error_rows_unlocked(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT job_id, error FROM jobs WHERE error IS NOT NULL AND error != ''").fetchall()
+    for row in rows:
+        original = row["error"]
+        cleaned = sanitize_error_message(original)
+        if cleaned != original:
+            conn.execute("UPDATE jobs SET error = ? WHERE job_id = ?", (cleaned, row["job_id"]))
 
 
 def _default_record(job_id: str, topic: str = "") -> dict[str, Any]:
@@ -180,6 +251,7 @@ async def _ensure_db() -> None:
                     "CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at DESC)"
                 )
                 _migrate_legacy_files_unlocked(conn)
+                _scrub_existing_error_rows_unlocked(conn)
                 conn.commit()
             finally:
                 conn.close()
@@ -220,6 +292,14 @@ def get_job_corpus(job_id: str) -> tuple[list[str], list[dict]]:
 def init_job_chunk_storage(job_id: str) -> None:
     JOB_CORPUS[job_id] = []
     JOB_CHUNK_META[job_id] = []
+
+
+def set_synthesis_debug(job_id: str, payload: dict[str, Any]) -> None:
+    SYNTHESIS_DEBUG[job_id] = payload
+
+
+def get_synthesis_debug(job_id: str) -> Optional[dict[str, Any]]:
+    return SYNTHESIS_DEBUG.get(job_id)
 
 
 async def register_job_in_index(job_id: str, topic: str) -> None:
@@ -336,6 +416,7 @@ async def delete_research_job(job_id: str) -> bool:
         existed = True
     JOB_CORPUS.pop(job_id, None)
     JOB_CHUNK_META.pop(job_id, None)
+    SYNTHESIS_DEBUG.pop(job_id, None)
     report_stream_queues.pop(job_id, None)
 
     return existed
@@ -367,6 +448,7 @@ async def update_research_status(job_id: str, **kwargs: Any) -> None:
 
     data.update(patch)
     data["job_id"] = job_id
+    data["error"] = sanitize_error_message(data.get("error"))
 
     def _write_db() -> None:
         conn = _connect_db()

@@ -253,7 +253,8 @@ async def run_research_loop(topic: str, job_id: str) -> None:
             )
         except Exception as e:
             logger.exception("synthesize: %s", e)
-            report = f"## Summary\nSynthesis failed: {e}\n"
+            safe_error = services.sanitize_error_message(e) or "unknown error"
+            report = f"## Summary\nSynthesis failed: {safe_error}\n"
             n_domains = 0
             from .models import GroundingResult
 
@@ -282,10 +283,11 @@ async def run_research_loop(topic: str, job_id: str) -> None:
         logger.exception("run_research_loop failed: %s", e)
         timings["total_seconds"] = round(perf_counter() - t_job, 3)
         await services.finish_report_stream(job_id)
+        safe_error = services.sanitize_error_message(e)
         await services.update_research_status(
             job_id,
             status="error",
             step="error",
-            error=str(e),
+            error=safe_error,
             timings=dict(timings),
         )
