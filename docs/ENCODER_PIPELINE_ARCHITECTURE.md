@@ -153,7 +153,7 @@ The frontend retains the existing input, report cards, and sidebar styling. It r
 
 `GET /debug/synthesis/{job_id}` now exposes the shared pipeline snapshot, including job ID, timezone-aware timestamp, pipeline version, effective nonsecret retrieval settings, the actual search response batches, source chunks, fused candidates and ranks, all reranker scores, duplicate exclusions, selected context, exact synthesis prompt, actual provider/model, grounding, and stage timings.
 
-Legacy `used_chunks`, `retrieved_chunks`, `used_count`, and `retrieved_count` fields remain available. `chunks_kept_after_rerank` retains `bge_score` as an alias for `score` for older consumers. CLI snapshots use microsecond UTC filenames to avoid same-minute overwrites. A failed CLI run still saves partial diagnostics and exits nonzero. CLI lexical and diagnostic memory is released after the snapshot is obtained.
+Legacy `used_chunks`, `retrieved_chunks`, `used_count`, and `retrieved_count` fields remain available. `chunks_kept_after_rerank` retains `bge_score` as an alias for `score` for older consumers. CLI snapshots use a fixed output directory anchored to the runner's repository location and exclusively created filenames containing a microsecond UTC timestamp plus a random suffix. Command-line topics and model output appear only in JSON data, never in directory or filename components. A failed CLI run still saves partial diagnostics and exits nonzero. CLI lexical and diagnostic memory is released after the snapshot is obtained.
 
 Critical stage failures stop processing and preserve partial diagnostics. Retry handles at most five request attempts, waiting only between attempts. Grounding or generation failures also end application jobs and close their stream.
 

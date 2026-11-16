@@ -9,6 +9,7 @@ import asyncio
 import json
 import re
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -67,17 +68,28 @@ async def searcher_scrape(results: list[dict]):
     return await scraper.extract_parallel(results, concurrency=agent.SCRAPE_CONCURRENCY)
 
 
+def write_debug_snapshot(snapshot: dict) -> Path:
+    """Write diagnostic data without letting user/model text select a path."""
+    out_dir = Path(__file__).resolve().parent / "debug_output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S_%f")
+    # mkstemp-backed creation chooses an exclusive filename. The topic remains
+    # JSON data only; neither it nor any model output is a filesystem component.
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=out_dir,
+        prefix=f"encoder_{stamp}_", suffix=".json", delete=False,
+    ) as output:
+        json.dump(snapshot, output, indent=2, ensure_ascii=False)
+        return Path(output.name)
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print('Usage: python debug_runner_clean_encoder.py "your test topic here"')
         raise SystemExit(1)
     topic = " ".join(sys.argv[1:]).strip()
     snapshot = asyncio.run(run_debug(topic))
-    out_dir = Path("debug_output")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S_%f")
-    out_path = out_dir / f"{slugify_topic(topic)}_encoder_{stamp}.json"
-    out_path.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8")
+    out_path = write_debug_snapshot(snapshot)
     print(f"Written to {out_path.as_posix()}")
     if not snapshot.get("synthesis_success"):
         print("Pipeline failed; see the snapshot error and stage.")

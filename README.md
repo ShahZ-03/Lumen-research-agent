@@ -97,7 +97,7 @@ FastAPI stores ordered turns and full reports in SQLite. It builds model context
 python debug_runner_clean_encoder.py "How does hybrid retrieval improve evidence selection?"
 ```
 
-The CLI writes timestamped JSON under `debug_output`, records a partial snapshot on failure, and exits nonzero when processing fails. Both CLI and app use the same selected-evidence algorithm; provider streaming and model randomness can still change generated report text.
+The CLI writes timestamped JSON under the repository's `debug_output` directory, records a partial snapshot on failure, and exits nonzero when processing fails. Filenames contain only a UTC timestamp and an exclusively created random suffix; topics and model output remain JSON data and never select the output path. Both CLI and app use the same selected-evidence algorithm; provider streaming and model randomness can still change generated report text.
 
 ## Configuration
 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import pickle
 import sys
 import threading
@@ -12,6 +13,65 @@ import pytest
 from backend import agent, chunker, evidence, groq_client, llm_fallback, reranker, retry, synthesizer
 from backend.models import GroundingResult, ScoredChunk
 from backend.vecstore import EMBED_DIM, LazyVectorStore, VectorStore
+
+
+@pytest.mark.parametrize("topic", [
+    "../../outside", r"..\..\outside", "/etc/cron.d/outside",
+    r"C:\Windows\System32\outside", "%2e%2e%2foutside",
+    "question/../../../outside", "雪 and unicode research",
+])
+def test_cli_topic_cannot_select_snapshot_path(tmp_path, monkeypatch, topic):
+    import debug_runner_clean_encoder as runner
+
+    unrelated_cwd = tmp_path / "elsewhere"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+    monkeypatch.setattr(runner, "__file__", str(tmp_path / "debug_runner_clean_encoder.py"))
+    monkeypatch.setattr(sys, "argv", ["debug_runner_clean_encoder.py", topic])
+    monkeypatch.setattr(runner, "run_debug", AsyncMock(return_value={
+        "topic": topic, "synthesis_success": True, "synthesis_provider": "test",
+    }))
+
+    runner.main()
+
+    snapshots = list((tmp_path / "debug_output").glob("*.json"))
+    assert len(snapshots) == 1
+    assert snapshots[0].name.startswith("encoder_")
+    assert snapshots[0].resolve().parent == (tmp_path / "debug_output").resolve()
+    assert json.loads(snapshots[0].read_text(encoding="utf-8"))["topic"] == topic
+    assert list(unrelated_cwd.iterdir()) == []
+    assert list(tmp_path.rglob("*.json")) == snapshots
+
+
+def test_snapshot_creation_never_overwrites_an_existing_snapshot(tmp_path, monkeypatch):
+    import debug_runner_clean_encoder as runner
+    from datetime import datetime, timezone
+
+    fixed_time = datetime(2026, 11, 16, tzinfo=timezone.utc)
+    monkeypatch.setattr(runner, "__file__", str(tmp_path / "debug_runner_clean_encoder.py"))
+    monkeypatch.setattr(runner, "datetime", SimpleNamespace(now=lambda tz: fixed_time))
+    first = runner.write_debug_snapshot({"topic": "first"})
+    second = runner.write_debug_snapshot({"topic": "second"})
+    assert first != second
+    assert first.parent == second.parent == tmp_path / "debug_output"
+    assert json.loads(first.read_text(encoding="utf-8"))["topic"] == "first"
+    assert json.loads(second.read_text(encoding="utf-8"))["topic"] == "second"
+
+
+def test_failed_cli_run_still_saves_diagnostics_and_exits_nonzero(tmp_path, monkeypatch):
+    import debug_runner_clean_encoder as runner
+
+    monkeypatch.setattr(runner, "__file__", str(tmp_path / "debug_runner_clean_encoder.py"))
+    monkeypatch.setattr(sys, "argv", ["debug_runner_clean_encoder.py", "../failed"])
+    monkeypatch.setattr(runner, "run_debug", AsyncMock(return_value={
+        "topic": "../failed", "synthesis_success": False, "error": "test failure",
+    }))
+    with pytest.raises(SystemExit) as error:
+        runner.main()
+    assert error.value.code == 1
+    files = list((tmp_path / "debug_output").glob("*.json"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text(encoding="utf-8"))["error"] == "test failure"
 
 
 def bare_store(path):
