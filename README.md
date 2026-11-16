@@ -1,435 +1,138 @@
 # Lumen Research Agent
 
-Lumen turns open-web research into a reliable, auditable workflow: ask a question and get a structured, source-grounded report in minutes instead of hours. It is built for real-world reliability, with async orchestration, hybrid retrieval, streaming synthesis, and layered safeguards against provider throttling. The result is a fast research assistant that stays responsive even under API pressure.
+Lumen searches the open web, retrieves evidence, reranks it with a local cross encoder, and generates a structured research report with sources. FastAPI application jobs and the encoder evaluation CLI share one backend pipeline.
 
-Lumen is an asynchronous research web app that:
+![App Screenshot](assets/LM1.png)
 
-- accepts a user topic,
-- decomposes it into sub-questions,
-- searches the web and extracts text,
-- scores and indexes evidence,
-- retrieves with a hybrid lexical + semantic strategy,
-- synthesizes a grounded report with live streaming, and
-- exposes progress, history, and deletion through a React frontend.
+## Quickstart
 
-This document explains the architecture, backend control flow, async design, fallback/retry behavior, and rate-limit protections in detail.
+Use Python 3.10 or later and Node.js 18 or later for the frontend. Install the backend packages in your development environment:
 
-## Screenshots
-
-User Interface:
-
-![App Screenshot 1](assets/LM1.png)
-
-## Demo
-
-![Demo GIF](assets/Lumenresearchagent-ezgif.com-video-to-gif-converter%20(2).gif)
-
-## Prerequisites / Quickstart
-
-### Prerequisites
-
-- Python 3.10+ with backend dependencies installed
-- Node.js 18+ with npm
-- Required API keys in `.env`:
-  - `GROQ_API_KEY`
-  - `TAVILY_API_KEY`
-- Optional:
-  - `GEMINI_API_KEY` (used for fallback on specific Groq rate-limit paths)
-  - `REDIS_URL` (Redis is optional; app runs with SQLite-only persistence)
-
-Copy and fill the template:
-
-```bash
-cp .env.example .env
+```powershell
+python -m pip install -r requirements.txt
 ```
 
-### Quickstart
+Install the Torch build appropriate to your GPU if you want CUDA inference. The local reranker uses CUDA when available, otherwise CPU. Models load on first use; cached models or download access are required.
 
-1) Start backend:
+Copy `.env.example` to `.env` and set Tavily, Groq, and Gemini keys. Gemini handles initial planning and the conditional synthesis fallback. SQLite works without a Redis server.
 
-```bash
+```powershell
 uvicorn backend.main:app --reload --port 8000
 ```
 
-2) Start frontend:
+Start the frontend in another terminal:
 
-```bash
+```powershell
 cd frontend
 npm install
 npm run dev
 ```
 
-3) Open:
+Open the frontend URL printed by Vite, normally `http://localhost:8080`.
 
-- `http://localhost:8080`
+## Shared backend pipeline
 
-## Tech Stack
+`POST /research` schedules `services.run_research_task`, which manages the job lifecycle and calls `pipeline.run_pipeline`. `debug_runner_clean_encoder.py` calls the same function.
 
-### Backend
+1. Decompose and expand the topic into multiple search questions.
+2. Search each question sequentially and record those exact results once.
+3. Resolve source text, clean web noise, and split it into overlapping sentence-aware chunks.
+4. Embed all cleaned chunks with MiniLM and index them with job metadata.
+5. Retrieve up to 40 candidates with BM25 and dense vectors merged through RRF.
+6. Rerank those candidates with `BAAI/bge-reranker-base`, remove near-duplicates, and select up to eight chunks using proportional source quotas.
+7. Synthesize from the exact selected evidence with an explicit topic and source labels, then run the existing claim-similarity grounding layer.
 
-- `FastAPI` for HTTP API and background job orchestration
-- `asyncio` for non-blocking pipeline stages and controlled concurrency
-- `httpx` for outbound async HTTP calls
-- `FAISS` + `sentence-transformers` for vector retrieval
-- `rank-bm25` for lexical retrieval
-- `SQLite` for durable job persistence
-- Optional `Redis` for status caching
+The old application's LLM scoring before indexing, first-30-chunk limit, and sufficiency loop are not on the default path. App jobs still provide progress, history, optional live streaming, and grounding results. Grounding uses embedding similarity, not proof that each claim is correct.
 
-### Frontend
+[Read the architecture, decisions, migration differences, and limitations](docs/ENCODER_PIPELINE_ARCHITECTURE.md).
 
-- React 19 + TanStack Router/Start (Vite-based)
-- Tailwind CSS + UI components
-- Streaming report reader via Fetch `ReadableStream`
+## Where to make changes
 
-## High-Level Architecture
+| File | Responsibility |
+| --- | --- |
+| `backend/pipeline.py` | Stage sequencing, timing, and error propagation only |
+| `backend/agent.py` | Topic planning and question expansion |
+| `backend/searcher.py` | Web discovery, pacing, and per-query logging |
+| `backend/scraper.py` | Source extraction and HTTP fallback |
+| `backend/chunker.py` | Text cleaning, chunk preparation, and stable chunk IDs |
+| `backend/evidence.py` | Duplicate detection, source ordering, and proportional selection |
+| `backend/retrieval.py` | Candidate retrieval through final evidence selection |
+| `backend/reranker.py` | Lazy local cross-encoder inference and timing |
+| `backend/hybrid_retrieval.py` | BM25 plus dense reciprocal rank fusion |
+| `backend/vecstore.py` | Embedding model, FAISS, job isolation, checkpoint persistence |
+| `backend/synthesizer.py` | Topic-aware prompt, generation, streaming, grounding |
+| `backend/services.py` | Job lifecycle, persistence, corpus indexing, diagnostics, and stream queues |
+| `backend/models.py` | API models and diagnostic snapshot data contract |
+| `backend/main.py` | HTTP API |
+| `debug_runner_clean_encoder.py` | Thin CLI adapter and helper compatibility exports |
 
-1. Frontend starts a job with `POST /research`.
-2. Backend immediately returns `job_id` and schedules a background task.
-3. Frontend:
-   - polls `/status/{job_id}` for step and timing updates,
-   - consumes `/stream/report/{job_id}` for live synthesis tokens.
-4. Backend pipeline runs async stages:
-   - planning/decomposition,
-   - sequential search,
-   - bounded parallel extraction,
-   - chunking and relevance scoring,
-   - batched vector insertion,
-   - sufficiency evaluation loop,
-   - hybrid retrieval + synthesis + grounding.
-5. Job metadata and final report are persisted in SQLite and listed in `/jobs`.
+Make pipeline changes in these shared modules so both the API and encoder CLI receive them. Other experiment runners remain separate historical implementations and are not the application source of truth.
 
-## Repository Layout
+## API
 
-- `backend/main.py`: API surface and stream endpoint
-- `backend/agent.py`: main async research loop
-- `backend/services.py`: SQLite/Redis status + queues + in-memory corpus
-- `backend/searcher.py`: Tavily search orchestration (rate-limit friendly)
-- `backend/scraper.py`: async extraction fallback
-- `backend/chunker.py`: sentence-aware chunking with overlap
-- `backend/scorer.py`: LLM relevance scoring of chunks
-- `backend/vecstore.py`: FAISS index and vector search
-- `backend/hybrid_retrieval.py`: BM25 + FAISS fusion (RRF)
-- `backend/synthesizer.py`: prompting, true streaming, fallback generation
-- `backend/retry.py`: async retry/backoff utility
-- `frontend/src/routes/index.tsx`: primary app page and stream consumer
-- `frontend/src/components/*`: input/progress/report/history UI
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /research` | Start research from `{ "topic": "..." }` |
+| `GET /status/{job_id}` | Job state, report, timings, and grounding |
+| `GET /jobs` | Research history |
+| `GET /conversations/{conversation_id}` | Ordered questions, reports, and status for a conversation |
+| `DELETE /jobs/{job_id}` | Delete history and in-memory job state |
+| `GET /stream/report/{job_id}` | Live report text or terminal report replay |
+| `GET /debug/synthesis/{job_id}` | Shared pipeline diagnostic snapshot |
+| `GET /health` | Health check |
 
-## API Endpoints
+Failures end jobs with `status=error` and close report streams. Partial token streams are never restarted into a second concatenated report.
 
-- `POST /research`
-  - input: `{ "topic": "..." }`
-  - output: `{ "job_id": "...", "status": "processing" }`
-  - schedules async background execution
+## Follow-up conversations
 
-- `GET /status/{job_id}`
-  - returns structured job state:
-    - `status`, `step`, `iteration`, `timings`, `report`, `grounding`, etc.
+The original input stays available below the reports. Follow-ups append to the same conversation, and previous questions and answers remain visible. Selecting a history entry restores its full conversation; refreshing the page reopens the last selected job when browser storage is available. New research starts an independent conversation.
 
-- `GET /stream/report/{job_id}`
-  - streams report text chunks while synthesis is running
-  - replays full report immediately for already-completed jobs
+Start with `POST /research` and `{ "topic": "Explain hybrid retrieval" }`. The response includes `job_id` and `conversation_id`. To continue, send `{ "topic": "What are its limitations?", "conversation_id": "<returned conversation_id>" }` to the same endpoint. Each turn remains its own research job, preserving status and streaming APIs.
 
-- `GET /jobs`
-  - returns history list from SQLite (`job_id`, `topic`, timestamps, status)
+FastAPI stores ordered turns and full reports in SQLite. It builds model context from completed turns in that conversation, resolves follow-up references into a standalone retrieval topic, and includes conversation history in synthesis. Earlier answers are conversational context, not verified evidence. Model input is bounded to the original exchange plus recent exchanges, up to six prior completed turns and 12,000 characters; complete history remains persisted. Existing job databases are migrated additively. Unknown conversations return 404, and submitting while an answer in that conversation is still running returns 409.
 
-- `GET /debug/synthesis/{job_id}`
-  - returns retrieval/synthesis debug snapshot for troubleshooting quality
-  - includes retrieved chunk snippets, chunks actually used in prompt, and selected provider/model
+## CLI diagnostics
 
-- `DELETE /jobs/{job_id}`
-  - removes job from SQLite + optional Redis + in-memory stores
-
-- `GET /health`
-  - health probe
-
-## Backend Logic: Step-by-Step
-
-The orchestrator is `run_research_loop()` in `backend/agent.py`.
-
-### 1) Job initialization
-
-- A report queue is created per job (`asyncio.Queue`) for streaming output.
-- Status is persisted as `processing` with step `starting/decomposing`.
-- Timings dict starts empty and is incrementally updated.
-
-### 2) Topic decomposition
-
-- `decompose_topic()` asks the LLM for 3-5 focused search questions.
-- If decomposition fails, pipeline falls back to `[original_topic]`.
-
-### 3) Search stage (rate-limit aware)
-
-- `search_queries_sequential()` runs queries one by one (not `gather`).
-- A delay (`TAVILY_SEARCH_DELAY`) is inserted between queries.
-- Results are URL-deduplicated.
-- This controlled pattern lowers burst pressure on search APIs.
-
-### 4) Extraction stage
-
-- For each result:
-  - prefer Tavily `raw_content` if available,
-  - else scrape URL directly with `httpx` + BeautifulSoup.
-- `extract_parallel()` uses `asyncio.Semaphore` to cap concurrent fetches.
-- This balances throughput while avoiding outbound spikes.
-
-### 5) Chunking stage
-
-- `chunk_text()` in `backend/chunker.py`:
-  - sentence-aware split,
-  - hard caps oversized sentence units,
-  - target chunk length with overlap,
-  - discards very short chunks.
-- Overlap preserves context continuity for retrieval/synthesis.
-
-### 6) Relevance scoring stage
-
-- Chunks are scored in small batches (`SCORE_BATCH_SIZE`).
-- Between batches, random delay is added (`SCORE_BATCH_DELAY_MIN/MAX`).
-- Only chunks above `RELEVANCE_THRESHOLD` are retained.
-- If LLM scoring fails for a batch, that batch gracefully degrades to score `0.0`.
-
-### 7) Embedding + vector indexing
-
-- Filtered chunks are inserted into FAISS in batches (`VECTORIZATION_BATCH_SIZE`).
-- Insert is run in `asyncio.to_thread(...)` to keep event loop responsive.
-- Metadata includes `job_id` and `chunk_index` for scoped retrieval.
-- Parallel in-memory lexical corpus is updated for BM25.
-
-### 8) Sufficiency loop
-
-- Hybrid retrieval pulls top evidence snippets.
-- LLM judges if evidence is sufficient (`sufficient: true/false`) and identifies gaps.
-- If insufficient:
-  - follow-up sub-questions are generated,
-  - loop continues until sufficient or max iterations reached.
-
-### 9) Synthesis + grounding
-
-- Hybrid retrieval produces synthesis context.
-- Prompt enforces strict grounding and structured output.
-- True token streaming from Groq feeds queue in real time.
-- Grounding step extracts claims and verifies via embedding similarity.
-- Final job status is persisted as `complete` with report + grounding.
-
-### Pipeline flow diagram
-
-```mermaid
-flowchart TD
-    A[1. Init job + queue + status] --> B[2. Decompose topic]
-    B --> C[3. Sequential web search]
-    C --> D[4. Extract text<br/>raw_content or scrape]
-    D --> E[5. Chunk documents]
-    E --> F[6. Score relevance]
-    F --> G[7. Embed + store vectors]
-    G --> H[8. Evaluate sufficiency]
-    H -->|insufficient + iterations left| C
-    H -->|sufficient or max iterations| I[9. Hybrid retrieve + synthesize + ground]
-    I --> J[Persist final status/report]
+```powershell
+python debug_runner_clean_encoder.py "How does hybrid retrieval improve evidence selection?"
 ```
 
-## How the Frontend Was Built
+The CLI writes timestamped JSON under `debug_output`, records a partial snapshot on failure, and exits nonzero when processing fails. Both CLI and app use the same selected-evidence algorithm; provider streaming and model randomness can still change generated report text.
 
-The app is a single main route (`frontend/src/routes/index.tsx`) with focused components:
+## Configuration
 
-- `TopicInput`: starts jobs
-- `Progress`: polls status and shows active step/iteration
-- `Report`: renders markdown + grounding metadata
-- `JobSidebar`: lists history and supports permanent deletion with confirmation
+Copy `.env.example` for the supported settings. Main defaults:
 
-### Frontend control flow
+| Setting | Default |
+| --- | --- |
+| `RETRIEVAL_TOP_K` | `40` |
+| `MAX_SYNTHESIS_CHUNKS` | `8` |
+| `CROSS_ENCODER_MODEL` | `BAAI/bge-reranker-base` |
+| `CROSS_ENCODER_BATCH_SIZE` | `32` |
+| `CROSS_ENCODER_MAX_CHARS` | `1500` |
+| `MAX_RESULTS_PER_QUERY` | `5` |
+| `SCRAPE_CONCURRENCY` | `5` |
+| `TAVILY_SEARCH_DELAY` | `0.35` |
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` |
+| `GEMINI_MODEL` | `gemini-2.5-flash` |
+| `SYNTHESIS_PROVIDER` | `groq` |
+| `VEC_PATH` | `data/faiss_index` |
 
-1. User submits topic -> `POST /research`.
-2. Route stores `jobId`, initializes optimistic status, enables polling.
-3. A stream fetch is opened to `/stream/report/{jobId}`.
-4. Bytes from `ReadableStream` are decoded incrementally and appended to UI text.
-5. Polling `GET /status/{jobId}` drives pipeline state display.
-6. On completion, stream stops and final report/grounding remains available from status.
+Use a separate `VEC_PATH` for isolated evaluations. `MAX_ITERATIONS`, `RELEVANCE_THRESHOLD`, and the old scoring delays do not affect the shared default pipeline. Chunk target/overlap remain the evaluated 800/100 character constants.
 
-### API wiring
+## Persistence and runtime limits
 
-- Vite dev server proxies `/research`, `/status`, `/jobs`, `/stream`, `/health` to backend.
-- Optional `VITE_API_URL` can override the base API host.
+Reports and history persist in SQLite at `DB_PATH`, default `data/lumen.db`. Redis caching is optional. Lexical job corpora, snapshots, and stream queues live in memory.
 
-## Async Model (Why Everything Stays Responsive)
+Vector writes use an atomically replaced `<VEC_PATH>.store` checkpoint. Existing `.index` and `.meta` files are imported when no checkpoint exists; they remain untouched after migration. A present `.store` is authoritative. The vector index is append-only, and deleting history does not physically compact vectors.
 
-The backend is intentionally async-first:
+Run one backend worker per vector path: model/index locks coordinate threads within a process, not separate server workers. Streaming uses the existing in-process job queue. Shared pipeline refactoring does not add distributed scheduling or multi-subscriber stream fan-out.
 
-- FastAPI endpoints are async and non-blocking.
-- Long work runs in background tasks, so request/response stays fast.
-- Outbound network calls (search/scrape/LLM) use `httpx.AsyncClient`.
-- Concurrency is bounded with semaphores and staged loops.
-- CPU/blocking operations are isolated via `asyncio.to_thread`.
-- Report streaming uses async queues and `StreamingResponse`.
+## Verification
 
-The frontend is also stream-aware:
-
-- incremental report rendering from response chunks,
-- separate status polling channel for deterministic state updates.
-
-## Complete Fallback Logic
-
-Fallbacks exist at multiple layers so jobs complete even under partial failures.
-
-### Search fallback
-
-- Missing Tavily key -> empty results (no crash).
-- Tavily errors -> retried via `async_retry`.
-- Persistent failure -> logs + continue pipeline.
-
-### Extraction fallback
-
-- Prefer provider `raw_content` first.
-- If absent -> direct scrape.
-- Individual scrape failures return empty string, not fatal.
-
-### Scoring fallback
-
-- Batch-level LLM scoring failures are caught.
-- Failed batch yields zero-scored chunks and pipeline continues.
-
-### Synthesis fallback
-
-- Primary path: true token streaming from Groq.
-- If streaming fails:
-  - fallback to non-stream synthesis path.
-- Non-stream synthesis uses `generate_with_fallback(...)`:
-  - primary Groq,
-  - fallback to Gemini only on explicit rate-limit signals (`RATE_LIMIT`).
-
-### Status/persistence fallback
-
-- Optional Redis:
-  - used when available for status acceleration.
-- Durable source of truth:
-  - SQLite row per job.
-- If Redis read misses/fails, status is read from SQLite.
-
-## Hybrid Retrieval Explained
-
-`backend/hybrid_retrieval.py` combines:
-
-- **Dense retrieval** from FAISS (semantic similarity),
-- **Lexical retrieval** from BM25 (exact token matching),
-- **Reciprocal Rank Fusion (RRF)** to merge both ranked lists.
-
-Why this is better than vector-only:
-
-- Dense retrieval captures semantic intent/synonyms.
-- BM25 preserves exact keywords/entities/identifiers.
-- RRF is robust to scoring-scale differences and improves ranking stability.
-
-Result: better recall and better evidence diversity for synthesis/grounding.
-
-## Retry and Anti-429 Strategy
-
-The project uses layered controls to reduce and survive rate limits:
-
-### 1) Request pacing and fan-out limits
-
-- Sequential query execution for Tavily
-- Inter-query delays
-- Bounded scrape concurrency
-- Groq semaphore to cap concurrent model calls
-
-### 2) Smaller payloads and bounded batch sizes
-
-- chunk caps/truncation
-- limited chunk counts for scoring/synthesis
-- vector insertion batching
-- score batching + random jitter delay
-
-### 3) Explicit backoff retry
-
-`async_retry()` differentiates:
-
-- 429/rate-limit signals -> longer backoff schedule
-- other transient failures -> shorter backoff schedule
-
-This prevents immediate hammering of upstream providers.
-
-### 4) Multi-model fallback on rate-limit conditions
-
-- Synthesis attempts Groq first.
-- If rate-limited in fallback path, route to Gemini.
-- Preserves end-user continuity during provider pressure.
-
-### 5) Fault-tolerant stage boundaries
-
-- Most stages catch errors locally, log them, and continue where safe.
-- Job-level catastrophic failures still return a terminal `error` state cleanly.
-
-## Persistence Model
-
-Current durable persistence is SQLite (`data/lumen.db`):
-
-- table: `jobs`
-- stores full status lifecycle and final report fields
-- history listing sorted by `updated_at`
-- one-time migration imports legacy JSON records if DB is empty
-
-Transient/in-memory per-job structures:
-
-- `JOB_CORPUS` and `JOB_CHUNK_META` for lexical/hybrid retrieval
-- `report_stream_queues` for live token streaming
-
-## Environment Variables
-
-See `.env.example` for the full list. The most important non-obvious knobs are:
-
-- `MAX_ITERATIONS`: maximum retrieval/evaluation loops before synthesis
-- `TAVILY_SEARCH_DELAY`: delay between sequential Tavily calls (reduces search API burst rate)
-- `SCRAPE_CONCURRENCY`: cap on parallel extraction fetches
-- `SCORE_BATCH_DELAY_MIN` / `SCORE_BATCH_DELAY_MAX`: jitter delay between relevance-scoring batches
-- `VECTORIZATION_BATCH_SIZE`: number of chunks embedded per insertion batch
-- `DB_PATH`: optional SQLite location (default `data/lumen.db`)
-- `GROUNDING_THRESHOLD`: cosine-similarity threshold for claim verification
-- `SYNTHESIS_PROVIDER`: `groq` (default) or `gemini`
-- `GROQ_MODEL`: overrides Groq synthesis model (default `llama-3.3-70b-versatile`)
-- `GEMINI_MODEL`: overrides Gemini model (default `gemini-1.5-flash`; can be `gemini-2.5-flash`)
-- `MAX_SYNTHESIS_CHUNKS`: cap prompt chunks used by synthesis (default `8`)
-
-## Local Development
-
-### 1) Backend
-
-```bash
-uvicorn backend.main:app --reload --port 8000
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest tests -q
 ```
 
-If port 8000 is occupied on Windows, use another port:
-
-```bash
-uvicorn backend.main:app --reload --port 8001
-```
-
-### 2) Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Frontend default local URL is `http://localhost:8080`.
-
-## Operational Notes
-
-- The global `httpx` client in `groq_client.py` is reused for efficiency.
-- Redis is optional; SQLite remains the durable system of record.
-- Deleting a job removes:
-  - SQLite row,
-  - Redis hash (if present),
-  - in-memory corpus and stream queue entries.
-
-## Why this design avoids rate-limit failures in practice
-
-Lumen does not rely on a single mechanism; it combines:
-
-- controlled concurrency,
-- explicit pacing,
-- retries with differentiated backoff,
-- fallback models for synthesis,
-- smaller/targeted contexts,
-- robust stage-level exception handling.
-
-This layered strategy is what keeps the app responsive and resilient under real-world API throttling and transient failures.
+Tests use fake API/model boundaries and temporary databases/checkpoints. They exercise shared app/CLI evidence selection, indexing and retrieval, streaming and failure behavior, and vector persistence without paid provider calls. Historical benchmark artifacts are not new results for this migrated pipeline.

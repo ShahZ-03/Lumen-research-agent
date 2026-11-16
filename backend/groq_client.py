@@ -18,7 +18,7 @@ GROQ_SEMAPHORE = asyncio.Semaphore(2)
 
 # 🔥 Reusable HTTP client (major performance improvement)
 CLIENT = httpx.AsyncClient(
-    timeout=httpx.Timeout(120.0, read=None)
+    timeout=httpx.Timeout(120.0)
 )
 
 
@@ -93,11 +93,13 @@ async def groq_stream_content(
 
     backoffs = (1.0, 2.0, 4.0)
     last_exc: Exception | None = None
+    emitted = False
 
     for attempt in range(1 + len(backoffs)):
         if attempt > 0:
             await asyncio.sleep(backoffs[attempt - 1])
 
+        finished = False
         try:
             async with GROQ_SEMAPHORE:
                 async with CLIENT.stream(
@@ -125,17 +127,25 @@ async def groq_stream_content(
 
                         try:
                             choice0 = (obj.get("choices") or [None])[0] or {}
+                            if choice0.get("finish_reason") is not None:
+                                finished = True
                             delta = choice0.get("delta") or {}
                             content = delta.get("content") or ""
                         except (TypeError, IndexError):
                             content = ""
 
                         if content:
+                            emitted = True
                             yield content
 
+            if not finished:
+                raise RuntimeError("Groq stream ended before a completion marker")
             return
 
         except Exception as e:
+            if emitted:
+                # Retrying after visible deltas would duplicate the report.
+                raise
             last_exc = e
 
     raise last_exc or RuntimeError("Streaming failed with unknown error")

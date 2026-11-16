@@ -45,10 +45,15 @@ Path("data/docs").mkdir(parents=True, exist_ok=True)
 @app.post("/research")
 async def start_research(req: ResearchRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
-    await services.init_research_job(job_id, req.topic)
+    try:
+        turn = await services.init_research_job(job_id, req.topic, req.conversation_id)
+    except services.ConversationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except services.ConversationBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     background_tasks.add_task(services.run_research_task, req.topic, job_id)
     logger.info("scheduled research job %s topic=%r", job_id, req.topic[:80])
-    return {"job_id": job_id, "status": "processing"}
+    return {"job_id": job_id, "status": "processing", **turn}
 
 
 def _status_to_model(job_id: str, info: dict) -> ResearchStatus:
@@ -61,6 +66,10 @@ def _status_to_model(job_id: str, info: dict) -> ResearchStatus:
             grounding = None
     return ResearchStatus(
         job_id=job_id,
+        topic=info.get("topic") or "",
+        conversation_id=info.get("conversation_id") or job_id,
+        parent_job_id=info.get("parent_job_id") or None,
+        turn_index=int(info.get("turn_index") or 0),
         status=str(info.get("status", "processing")),
         step=info.get("step"),
         iteration=info.get("iteration"),
@@ -95,11 +104,24 @@ async def list_research_jobs():
                     status=str(row.get("status", "")),
                     created_at=str(row.get("created_at", "")),
                     updated_at=str(row.get("updated_at", "")),
+                    conversation_id=row.get("conversation_id") or row["job_id"],
+                    turn_index=int(row.get("turn_index") or 0),
                 )
             )
         except Exception:
             continue
     return out
+
+
+@app.get("/conversations/{conversation_id}")
+async def conversation_history(conversation_id: str):
+    turns = await services.get_conversation(conversation_id)
+    if not turns:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {
+        "conversation_id": conversation_id,
+        "turns": [_status_to_model(turn["job_id"], turn) for turn in turns],
+    }
 
 
 @app.get("/debug/synthesis/{job_id}")
@@ -124,8 +146,8 @@ async def stream_report(job_id: str):
     if not info:
         raise HTTPException(status_code=404, detail="job_id not found")
 
-    if info.get("status") == "complete" and info.get("report"):
-        report = str(info["report"])
+    if info.get("status") in {"complete", "error"}:
+        report = str(info.get("report") or "")
 
         async def replay():
             yield report.encode("utf-8")

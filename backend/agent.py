@@ -1,21 +1,18 @@
-# backend/agent.py — research loop (sequential search; parallel capped scraping)
+"""Topic decomposition, question expansion, and legacy planning helpers."""
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import re
-from time import perf_counter
 
-from . import chunker, searcher, scraper, scorer, synthesizer
 from .llm_router import llm_generate
 from .hybrid_retrieval import hybrid_query
 
 logger = logging.getLogger("research_agent")
 
+# Legacy experiment constants; the shared default pipeline is single-pass.
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "2"))
-MAX_CHUNKS_FOR_SCORING = 30
 MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "5"))
 VECTORIZATION_BATCH_SIZE = int(os.getenv("VECTORIZATION_BATCH_SIZE", "32"))
 SCRAPE_CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "5"))
@@ -115,179 +112,77 @@ Respond ONLY with JSON: {{"sub_questions": ["...", ...]}}"""
     return [topic]
 
 
-async def run_research_loop(topic: str, job_id: str) -> None:
-    from . import services
+async def ensure_multiple_sub_questions(
+    topic: str, sub_questions: list[str]
+) -> tuple[list[str], str]:
+    """
+    Lower the threshold for multi-query search by expanding single-question plans.
+    """
+    unique = [q.strip() for q in sub_questions if q and q.strip()]
+    unique = list(dict.fromkeys(unique))
+    if len(unique) >= 3:
+        return unique[:5], "decompose"
 
-    timings: dict[str, float] = {}
-    t_job = perf_counter()
-    job_urls_seen: set[str] = set()
+    # If decomposition collapsed to one question, expand angles via follow-up planner.
+    try:
+        expanded = await followup_sub_questions(
+            topic,
+            [
+                "core concepts and definitions",
+                "recent developments",
+                "limitations, risks, and trade-offs",
+            ],
+        )
+    except Exception:
+        expanded = []
 
-    stream_q = services.ensure_report_queue(job_id)
+    merged = list(dict.fromkeys(unique + [q.strip() for q in expanded if q and q.strip()]))
+    if len(merged) >= 2:
+        return merged[:5], "followup"
 
-    await services.update_research_status(
-        job_id,
-        status="processing",
-        step="decomposing",
-        iteration=0,
-        report=None,
-        error=None,
-        timings={},
-        source_domains_count=None,
+    # Final heuristic fallback to force multi-query coverage.
+    return (
+        [
+            topic,
+            f"{topic} recent developments",
+            f"{topic} risks and limitations",
+        ][:5],
+        "heuristic",
     )
 
+
+async def plan_research(topic: str) -> tuple[list[str], str]:
+    """Create and expand one search plan using the shared planning policy."""
+    questions = await decompose_topic(topic)
+    return await ensure_multiple_sub_questions(topic, questions)
+
+
+async def resolve_followup_topic(question: str, messages: list[dict]) -> str:
+    """Resolve references for discovery and retrieval using server-side history."""
+    if not messages:
+        return question
+    prompt = f"""Rewrite the latest research question as one self-contained search topic.
+Resolve pronouns and references using the conversation. Preserve the user's
+intent, including when they change topics. Previous answers are unverified
+conversation context, not factual evidence. Do not answer the question.
+
+Conversation (JSON): {json.dumps(messages, ensure_ascii=False)}
+Latest question: {question}
+
+Respond ONLY with JSON: {{"research_topic": "self-contained question"}}"""
     try:
-        t0 = perf_counter()
-        sub_questions = await decompose_topic(topic)
-        timings["decompose_seconds"] = round(perf_counter() - t0, 3)
+        response = await llm_generate(prompt, task_type="planning")
+        resolved = (_extract_json_object(response) or {}).get("research_topic")
+        if isinstance(resolved, str) and resolved.strip():
+            return resolved.strip()[:4000]
+    except Exception:
+        logger.warning("Follow-up topic resolution failed; retaining explicit question context")
+    questions = [m["content"] for m in messages if m.get("role") == "user"]
+    return (f"Original topic: {questions[0][:800]}\nPrevious question: {questions[-1][:800]}\n"
+            f"Follow-up: {question}") if questions else question
 
-        for round_idx in range(MAX_ITERATIONS):
-            await services.update_research_status(
-                job_id, step="searching", iteration=round_idx, timings=dict(timings)
-            )
-            t0 = perf_counter()
-            results = await searcher.search_queries_sequential(
-                sub_questions, max_results=MAX_RESULTS_PER_QUERY
-            )
-            timings[f"search_round_{round_idx}_seconds"] = round(perf_counter() - t0, 3)
 
-            await services.update_research_status(
-                job_id, step="extracting", iteration=round_idx, timings=dict(timings)
-            )
-
-            to_fetch: list[dict] = []
-            for r in results:
-                u = (r.get("url") or "").strip()
-                if u:
-                    key = u.lower()
-                    if key in job_urls_seen:
-                        continue
-                    job_urls_seen.add(key)
-                to_fetch.append(r)
-
-            paired = await scraper.extract_parallel(
-                to_fetch, concurrency=SCRAPE_CONCURRENCY
-            )
-
-            chunk_items: list[dict] = []
-            for r, full in paired:
-                if not full.strip():
-                    continue
-                pieces = chunker.chunk_text(full)
-                url = r.get("url")
-                title = r.get("title")
-                for ch in pieces:
-                    chunk_items.append({"text": ch, "url": url, "title": title})
-
-            if len(chunk_items) > MAX_CHUNKS_FOR_SCORING:
-                chunk_items = chunk_items[:MAX_CHUNKS_FOR_SCORING]
-
-            await services.update_research_status(
-                job_id, step="scoring", iteration=round_idx, timings=dict(timings)
-            )
-            t0 = perf_counter()
-            try:
-                scored = await scorer.score_chunks(chunk_items, topic)
-            except Exception as e:
-                logger.exception("scoring: %s", e)
-                scored = []
-            timings[f"score_round_{round_idx}_seconds"] = round(perf_counter() - t0, 3)
-
-            await services.update_research_status(
-                job_id, step="embedding", iteration=round_idx, timings=dict(timings)
-            )
-            texts = [s.text for s in scored]
-            base = services.job_chunk_count(job_id)
-            metadatas = [
-                {
-                    "job_id": job_id,
-                    "url": s.url,
-                    "title": s.title,
-                    "chunk_index": base + i,
-                }
-                for i, s in enumerate(scored)
-            ]
-            t0 = perf_counter()
-            for bs in range(0, len(texts), VECTORIZATION_BATCH_SIZE):
-                batch_t = texts[bs : bs + VECTORIZATION_BATCH_SIZE]
-                batch_m = metadatas[bs : bs + VECTORIZATION_BATCH_SIZE]
-                if not batch_t:
-                    continue
-                try:
-                    await asyncio.to_thread(
-                        services.vec.add_texts, batch_t, batch_m
-                    )
-                    services.append_job_chunks(job_id, batch_t, batch_m)
-                except Exception as e:
-                    logger.exception("embedding batch: %s", e)
-            timings[f"embed_round_{round_idx}_seconds"] = round(perf_counter() - t0, 3)
-
-            await services.update_research_status(
-                job_id, step="evaluating", iteration=round_idx, timings=dict(timings)
-            )
-            try:
-                sufficient, missing = await evaluate_sufficiency(
-                    topic, job_id, services.vec
-                )
-            except Exception as e:
-                logger.exception("evaluate_sufficiency: %s", e)
-                sufficient, missing = True, []
-
-            if sufficient:
-                break
-            if round_idx >= MAX_ITERATIONS - 1:
-                break
-            sub_questions = await followup_sub_questions(topic, missing)
-            if not sub_questions:
-                break
-
-        await services.update_research_status(
-            job_id, step="synthesizing", iteration=None, timings=dict(timings)
-        )
-        t0 = perf_counter()
-        try:
-            report, n_domains, grounding = await synthesizer.generate(
-                topic,
-                job_id,
-                services.vec,
-                stream_queue=stream_q,
-            )
-        except Exception as e:
-            logger.exception("synthesize: %s", e)
-            safe_error = services.sanitize_error_message(e) or "unknown error"
-            report = f"## Summary\nSynthesis failed: {safe_error}\n"
-            n_domains = 0
-            from .models import GroundingResult
-
-            grounding = GroundingResult(
-                claims=[],
-                verified_count=0,
-                unverified_count=0,
-                overall_score=1.0,
-            )
-        timings["synthesize_seconds"] = round(perf_counter() - t0, 3)
-        timings["total_seconds"] = round(perf_counter() - t_job, 3)
-
-        await services.finish_report_stream(job_id)
-
-        await services.update_research_status(
-            job_id,
-            status="complete",
-            step="complete",
-            report=report,
-            error=None,
-            timings=dict(timings),
-            source_domains_count=n_domains,
-            grounding=grounding.model_dump(),
-        )
-    except Exception as e:
-        logger.exception("run_research_loop failed: %s", e)
-        timings["total_seconds"] = round(perf_counter() - t_job, 3)
-        await services.finish_report_stream(job_id)
-        safe_error = services.sanitize_error_message(e)
-        await services.update_research_status(
-            job_id,
-            status="error",
-            step="error",
-            error=safe_error,
-            timings=dict(timings),
-        )
+async def run_research_loop(topic: str, job_id: str) -> None:
+    """Compatibility entry point; services owns the application job lifecycle."""
+    from .services import run_research_task
+    await run_research_task(topic, job_id)

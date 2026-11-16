@@ -55,7 +55,9 @@ async def async_retry(
                     delay,
                 )
 
-            await asyncio.sleep(delay)
+            # There is no subsequent request to wait for after the last failure.
+            if attempt < max(len(backoffs_429), len(backoffs_other)) - 1:
+                await asyncio.sleep(delay)
 
     assert last_exc is not None
     raise last_exc

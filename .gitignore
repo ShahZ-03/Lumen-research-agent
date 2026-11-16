@@ -207,7 +207,9 @@ Thumbs.db
 # Data files (if generated)
 data/faiss_index.index
 data/faiss_index.meta
+data/*.store
 data/jobs_index.json
 data/docs/*.zip  node_modules/  .env 
 .env 
 node_modules/ 
+debug_output/

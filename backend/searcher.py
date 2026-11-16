@@ -1,4 +1,4 @@
-# backend/searcher.py — Tavily API (sequential queries, rate-limit friendly)
+# backend/searcher.py — Tavily API
 import asyncio
 import logging
 import os
@@ -52,9 +52,9 @@ async def search(query: str, max_results: int = 5) -> list[dict]:
 
 
 async def search_queries_sequential(
-    queries: list[str], max_results: int = 5
+    queries: list[str], max_results: int = 5, *, query_results: list[dict] | None = None
 ) -> list[dict]:
-    """Run each query one after another with a short delay (no asyncio.gather)."""
+    """Run each query one after another with a short delay."""
     merged: list[dict] = []
     seen_urls: set[str] = set()
     for i, q in enumerate(queries):
@@ -64,7 +64,9 @@ async def search_queries_sequential(
             batch = await search(q.strip(), max_results=max_results)
         except Exception as e:
             logger.exception("search_queries_sequential: %s", e)
-            continue
+            batch = []
+        if query_results is not None:
+            query_results.append({"query": q.strip(), "results": [dict(row) for row in batch]})
         for row in batch:
             u = row.get("url") or ""
             if u and u in seen_urls:
@@ -73,6 +75,17 @@ async def search_queries_sequential(
                 seen_urls.add(u)
             merged.append(row)
     return merged
+
+
+async def search_sources(queries: list[str], *, max_results: int = 5,
+                         query_results: list[dict] | None = None) -> list[dict]:
+    """Discover a nonempty source pool and log the same response batches once."""
+    results = await search_queries_sequential(
+        queries, max_results=max_results, query_results=query_results,
+    )
+    if not results:
+        raise RuntimeError("No search results were found; check search access or refine the topic")
+    return results
 
 
 if __name__ == "__main__":

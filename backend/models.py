@@ -1,10 +1,19 @@
 # backend/models.py
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 
 
 class ResearchRequest(BaseModel):
-    topic: str
+    topic: str = Field(min_length=1, max_length=8000)
+    conversation_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+
+    @field_validator("topic")
+    @classmethod
+    def nonempty_topic(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("A question is required")
+        return value
 
 
 class GroundedClaim(BaseModel):
@@ -24,6 +33,10 @@ class GroundingResult(BaseModel):
 
 class ResearchStatus(BaseModel):
     job_id: str
+    topic: str = ""
+    conversation_id: Optional[str] = None
+    parent_job_id: Optional[str] = None
+    turn_index: int = 0
     status: str  # processing | complete | error
     step: Optional[str] = None
     iteration: Optional[int] = None
@@ -42,6 +55,8 @@ class JobSummary(BaseModel):
     status: str
     created_at: str
     updated_at: str
+    conversation_id: Optional[str] = None
+    turn_index: int = 0
 
 
 class ScoredChunk(BaseModel):
@@ -62,17 +77,27 @@ class ChatRequest(BaseModel):
     # a single JSON object; defaults to False for backwards compatibility
     stream: Optional[bool] = False
 
-class ChatResponse(BaseModel):
-    answer: str
-    sources: Optional[List[str]] = None
-
-class GenerateNotesRequest(BaseModel):
-    doc_id: str
-    stream: Optional[bool] = False
-
-
 class StatusResponse(BaseModel):
     doc_id: str
     status: str
     error: Optional[str] = None
     timings: Dict[str, Any] = {}
+
+
+def new_pipeline_snapshot(topic: str, job_id: str, *, version: str,
+                          timestamp: str, config: dict) -> dict:
+    """Construct the API/CLI diagnostic data contract with fresh mutable fields."""
+    return {
+        "pipeline_version": version, "job_id": job_id, "topic": topic,
+        "timestamp": timestamp, "timings": {},
+        "config": dict(config),
+        "sub_questions": [], "sub_question_strategy": "",
+        "search_results": [], "chunks_by_source": [], "scored_chunks": [],
+        "chunks_kept_after_rerank": [], "retrieved_chunks": [],
+        "rerank_method": "cross_encoder", "rerank_latency_ms": {},
+        "scoring_fallback_triggered": False, "kept_count": 0, "dropped_count": 0,
+        "dedup_stats": {}, "synthesis_prompt": "", "synthesis_context": [],
+        "synthesis_output": "", "synthesis_success": False,
+        "synthesis_provider": "", "synthesis_fallback_triggered": False,
+        "source_domains_count": 0, "grounding": None,
+    }

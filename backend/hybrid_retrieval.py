@@ -74,6 +74,8 @@ def hybrid_query(
             vec_order.append(idx)
 
     fused = reciprocal_rank_fusion([vec_order, bm25_order], k=_RRF_K)
+    dense_ranks = {idx: rank + 1 for rank, idx in enumerate(vec_order)}
+    lexical_ranks = {idx: rank + 1 for rank, idx in enumerate(bm25_order)}
 
     out: list[dict] = []
     for idx in fused:
@@ -83,5 +85,11 @@ def hybrid_query(
             meta = dict(job_metas[idx])
             meta.setdefault("job_id", job_id)
             meta.setdefault("chunk_index", idx)
-            out.append({"text": job_corpus[idx], "metadata": meta})
+            rrf_score = sum(1.0 / (_RRF_K + ranks[idx])
+                            for ranks in (dense_ranks, lexical_ranks) if idx in ranks)
+            out.append({
+                "text": job_corpus[idx], "metadata": meta,
+                "retrieval": {"method": "hybrid_rrf", "dense_rank": dense_ranks.get(idx),
+                              "bm25_rank": lexical_ranks.get(idx), "rrf_score": rrf_score},
+            })
     return out

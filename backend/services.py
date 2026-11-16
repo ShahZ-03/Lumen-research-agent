@@ -9,6 +9,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -19,7 +20,7 @@ try:
 except ImportError:
     REDIS_AVAILABLE = False
 
-from .vecstore import VectorStore
+from .vecstore import LazyVectorStore
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 logger = logging.getLogger("research_agent")
@@ -33,7 +34,7 @@ if REDIS_AVAILABLE:
 else:
     redis_client = None
 
-vec = VectorStore(path=os.getenv("VEC_PATH", "data/faiss_index"))
+vec = LazyVectorStore(path=os.getenv("VEC_PATH", "data/faiss_index"))
 
 RESEARCH_KEY_PREFIX = "research:"
 DB_PATH = Path(os.getenv("DB_PATH", "data/lumen.db"))
@@ -126,6 +127,9 @@ def _default_record(job_id: str, topic: str = "") -> dict[str, Any]:
     ts = _now_iso()
     return {
         "job_id": job_id,
+        "conversation_id": job_id,
+        "parent_job_id": None,
+        "turn_index": 0,
         "topic": topic,
         "status": "processing",
         "step": None,
@@ -250,7 +254,18 @@ async def _ensure_db() -> None:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at DESC)"
                 )
+                # Additive migration keeps existing jobs and reports intact.
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+                for name, declaration in (
+                    ("conversation_id", "TEXT"),
+                    ("parent_job_id", "TEXT"),
+                    ("turn_index", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    if name not in columns:
+                        conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {declaration}")
                 _migrate_legacy_files_unlocked(conn)
+                conn.execute("UPDATE jobs SET conversation_id = job_id WHERE conversation_id IS NULL OR conversation_id = ''")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_conversation ON jobs(conversation_id, turn_index)")
                 _scrub_existing_error_rows_unlocked(conn)
                 conn.commit()
             finally:
@@ -302,27 +317,54 @@ def get_synthesis_debug(job_id: str) -> Optional[dict[str, Any]]:
     return SYNTHESIS_DEBUG.get(job_id)
 
 
-async def register_job_in_index(job_id: str, topic: str) -> None:
+class ConversationNotFoundError(LookupError):
+    pass
+
+
+class ConversationBusyError(ValueError):
+    pass
+
+
+async def register_job_in_index(job_id: str, topic: str, *, conversation_id: str | None = None) -> dict:
+    """Reserve an ordered turn atomically; only one turn may run per conversation."""
     await _ensure_db()
     ts = _now_iso()
 
-    def _insert() -> None:
+    def _insert() -> dict:
         conn = _connect_db()
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            parent = None
+            turn_index = 0
+            thread_id = conversation_id or job_id
+            if conversation_id:
+                latest = conn.execute(
+                    "SELECT job_id, turn_index, status FROM jobs WHERE conversation_id = ? ORDER BY turn_index DESC LIMIT 1",
+                    (conversation_id,),
+                ).fetchone()
+                if latest is None:
+                    raise ConversationNotFoundError("Conversation not found")
+                if latest["status"] == "processing":
+                    raise ConversationBusyError("Wait for the current answer before sending a follow-up")
+                parent = latest["job_id"]
+                turn_index = int(latest["turn_index"]) + 1
             conn.execute(
                 """
-                INSERT OR IGNORE INTO jobs (
-                    job_id, topic, status, created_at, updated_at, timings_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO jobs (
+                    job_id, topic, status, created_at, updated_at, timings_json,
+                    conversation_id, parent_job_id, turn_index
+                ) VALUES (?, ?, 'processing', ?, ?, '{}', ?, ?, ?)
                 """,
-                (job_id, topic or "", "processing", ts, ts, "{}"),
+                (job_id, topic, ts, ts, thread_id, parent, turn_index),
             )
             conn.commit()
+            return {"conversation_id": thread_id, "parent_job_id": parent, "turn_index": turn_index}
         finally:
             conn.close()
 
     async with _db_lock:
-        await asyncio.to_thread(_insert)
+        return await asyncio.to_thread(_insert)
+
 
 
 async def sync_job_index_status(
@@ -373,7 +415,7 @@ async def list_jobs() -> list[dict[str, Any]]:
         try:
             rows = conn.execute(
                 """
-                SELECT job_id, topic, status, created_at, updated_at
+                SELECT job_id, topic, status, created_at, updated_at, conversation_id, turn_index
                 FROM jobs
                 ORDER BY datetime(updated_at) DESC
                 """
@@ -457,8 +499,9 @@ async def update_research_status(job_id: str, **kwargs: Any) -> None:
                 """
                 INSERT INTO jobs (
                     job_id, topic, status, step, iteration, report, error, timings_json,
-                    source_domains_count, grounding_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_domains_count, grounding_json, created_at, updated_at,
+                    conversation_id, parent_job_id, turn_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     topic = excluded.topic,
                     status = excluded.status,
@@ -487,6 +530,9 @@ async def update_research_status(job_id: str, **kwargs: Any) -> None:
                     else None,
                     data.get("created_at") or _now_iso(),
                     data.get("updated_at") or _now_iso(),
+                    data.get("conversation_id") or job_id,
+                    data.get("parent_job_id"),
+                    int(data.get("turn_index") or 0),
                 ),
             )
             conn.commit()
@@ -519,10 +565,10 @@ async def update_research_status(job_id: str, **kwargs: Any) -> None:
     await sync_job_index_status(job_id, status=data.get("status"), topic=data.get("topic"))
 
 
-async def init_research_job(job_id: str, topic: str) -> None:
+async def init_research_job(job_id: str, topic: str, conversation_id: str | None = None) -> dict:
+    turn = await register_job_in_index(job_id, topic, conversation_id=conversation_id)
     init_job_chunk_storage(job_id)
     ensure_report_queue(job_id)
-    await register_job_in_index(job_id, topic)
     await update_research_status(
         job_id,
         topic=topic,
@@ -535,6 +581,7 @@ async def init_research_job(job_id: str, topic: str) -> None:
         source_domains_count=None,
         grounding=None,
     )
+    return turn
 
 
 def _hash_to_status(job_id: str, h: dict[str, str]) -> dict[str, Any]:
@@ -545,7 +592,7 @@ def _hash_to_status(job_id: str, h: dict[str, str]) -> dict[str, Any]:
                 data[k] = json.loads(v) if v else {}
             except json.JSONDecodeError:
                 data[k] = {}
-        elif k == "iteration":
+        elif k in {"iteration", "turn_index"}:
             if v == "" or v is None:
                 data[k] = None
             else:
@@ -609,9 +656,46 @@ async def get_research_status(job_id: str) -> Optional[dict[str, Any]]:
 
 
 async def run_research_task(topic: str, job_id: str) -> None:
-    from .agent import run_research_loop
+    """API job lifecycle around the same pipeline used by the encoder CLI."""
+    from .pipeline import run_pipeline
 
-    await run_research_loop(topic, job_id)
+    queue = ensure_report_queue(job_id)
+    started = perf_counter()
+
+    async def progress(step: str, timings: dict) -> None:
+        await update_research_status(
+            job_id, status="processing", step=step, iteration=None, timings=timings,
+        )
+
+    try:
+        context = await get_conversation_context(job_id)
+        result = await run_pipeline(
+            topic, job_id, stream_queue=queue, progress=progress,
+            conversation_context=context,
+        )
+        await update_research_status(
+            job_id, status="complete", step="complete", iteration=None,
+            report=result["synthesis_output"], error=None, timings=result["timings"],
+            source_domains_count=result["source_domains_count"], grounding=result["grounding"],
+        )
+    except asyncio.CancelledError:
+        await update_research_status(
+            job_id, status="error", step="error", iteration=None,
+            report=None, error="Research was cancelled",
+        )
+        raise
+    except Exception as exc:
+        logger.exception("Research pipeline failed for %s", job_id)
+        debug = get_synthesis_debug(job_id) or {}
+        timings = dict(debug.get("timings") or {})
+        timings["total_seconds"] = round(perf_counter() - started, 3)
+        await update_research_status(
+            job_id, status="error", step="error", iteration=None,
+            report=None, error=sanitize_error_message(exc), timings=timings,
+        )
+    finally:
+        # Close streams on success, errors, and cancellation.
+        await finish_report_stream(job_id)
 
 
 def get_logger(name: str = "research_agent") -> logging.Logger:
@@ -622,3 +706,90 @@ def get_logger(name: str = "research_agent") -> logging.Logger:
         log.addHandler(h)
         log.setLevel(logging.INFO)
     return log
+
+
+async def index_job_chunks(job_id: str, items: list[dict]) -> None:
+    """Commit vectors before publishing their aligned job-local lexical corpus."""
+    texts = [item["text"] for item in items]
+    metadata = [
+        {key: value for key, value in item.items() if key != "text"} | {"job_id": job_id}
+        for item in items
+    ]
+    # Resolve the lazy store inside the worker, including first-use model load.
+    await asyncio.to_thread(lambda: vec.add_texts(texts, metadata))
+    append_job_chunks(job_id, texts, metadata)
+
+
+def init_pipeline_diagnostics(topic: str, job_id: str, *, version: str) -> dict:
+    """Initialize transient job evidence and expose effective nonsecret settings."""
+    from . import agent, chunker, reranker, retrieval
+    from .models import new_pipeline_snapshot
+
+    config = {
+        "retrieval_top_k": retrieval.RETRIEVAL_TOP_K,
+        "max_synthesis_chunks": retrieval.MAX_SYNTHESIS_CHUNKS,
+        "cross_encoder_model": reranker.CROSS_ENCODER_MODEL,
+        "cross_encoder_batch_size": reranker.CROSS_ENCODER_BATCH_SIZE,
+        "cross_encoder_max_chars": reranker.CROSS_ENCODER_MAX_CHARS,
+        "max_results_per_query": agent.MAX_RESULTS_PER_QUERY,
+        "scrape_concurrency": agent.SCRAPE_CONCURRENCY,
+        "target_chunk_chars": chunker.TARGET_CHUNK_CHARS,
+        "overlap_chars": chunker.OVERLAP_CHARS,
+    }
+    snapshot = new_pipeline_snapshot(
+        topic, job_id, version=version, timestamp=_now_iso(), config=config,
+    )
+    init_job_chunk_storage(job_id)
+    set_synthesis_debug(job_id, snapshot)
+    return snapshot
+
+
+async def get_conversation(conversation_id: str) -> list[dict]:
+    """Read persisted turns in order, including after an application restart."""
+    await _ensure_db()
+
+    def _read():
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE conversation_id = ? ORDER BY turn_index, created_at, job_id",
+                (conversation_id,),
+            ).fetchall()
+            turns = []
+            for row in rows:
+                turn = dict(row)
+                turn["timings"] = json.loads(turn.pop("timings_json") or "{}")
+                turn["grounding"] = json.loads(turn.pop("grounding_json") or "null")
+                turns.append(turn)
+            return turns
+        finally:
+            conn.close()
+
+    async with _db_lock:
+        return await asyncio.to_thread(_read)
+
+
+async def get_conversation_context(job_id: str, *, max_turns: int = 6, max_chars: int = 12000) -> list[dict]:
+    """Use server-stored completed turns, bounded for model input only.
+
+    Full reports remain in SQLite. Keep the original topic and recent exchanges
+    so pronouns in follow-up questions can be resolved without mixing threads.
+    """
+    current = await get_research_status(job_id)
+    if not current or int(current.get("turn_index") or 0) == 0:
+        return []
+    turns = await get_conversation(current["conversation_id"])
+    previous = [turn for turn in turns
+                if turn["turn_index"] < current["turn_index"]
+                and turn["status"] == "complete" and turn.get("report")]
+    if not previous or max_turns < 1 or max_chars < 2:
+        return []
+    if len(previous) > max_turns:
+        previous = ([previous[0]] + previous[-(max_turns - 1):]) if max_turns > 1 else previous[-1:]
+    budget = max_chars // len(previous)
+    messages = []
+    for turn in previous:
+        question = turn["topic"][:min(800, budget // 3)]
+        answer = turn["report"][:max(0, budget - len(question))]
+        messages.extend([{"role": "user", "content": question}, {"role": "assistant", "content": answer}])
+    return messages

@@ -4,7 +4,7 @@ import os
 import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 def _gemini_url(model: str) -> str:
@@ -41,6 +41,9 @@ async def gemini_generate(
         data = response.json()
 
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception:
-        return str(data)
+        text = "".join(part.get("text", "") for part in data["candidates"][0]["content"]["parts"])
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise RuntimeError("Gemini returned no usable generated text") from exc
+    if not text.strip():
+        raise RuntimeError("Gemini returned empty generated text")
+    return text

@@ -11,6 +11,7 @@ export default defineConfig({
     server: {
       proxy: {
         "/research": "http://localhost:8000",
+        "/conversations": "http://localhost:8000",
         "/status": "http://localhost:8000",
         "/jobs": "http://localhost:8000",
         "/stream": "http://localhost:8000",

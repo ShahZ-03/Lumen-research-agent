@@ -1,41 +1,34 @@
 from __future__ import annotations
 
-from .groq_client import groq_generate
-from .gemini_client import gemini_generate
+from .groq_client import groq_generate, DEFAULT_MODEL as DEFAULT_GROQ_MODEL
+from .gemini_client import gemini_generate, DEFAULT_GEMINI_MODEL
 
 
-async def generate_with_fallback(
-    prompt: str,
-    *,
-    primary: str = "groq",
-    max_tokens: int = 1024,
-    temperature: float = 0.2,
-) -> str:
-    """
-    Try primary model first, fallback to secondary on failure.
-    """
+def is_rate_limit_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    return (getattr(response, "status_code", None) == 429
+            or "RATE_LIMIT" in str(exc) or "429" in str(exc))
 
+
+async def generate_with_details(prompt: str, *, primary: str = "groq", max_tokens: int = 1200,
+                                temperature: float = 0.2):
+    """Provider clients own retries; switch once on an exhausted rate limit."""
+    if primary == "gemini":
+        text = await gemini_generate(prompt, max_tokens=max_tokens)
+        return text, "gemini", DEFAULT_GEMINI_MODEL, False
     try:
-        if primary == "groq":
-            return await groq_generate(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-        else:
-            return await gemini_generate(prompt, max_tokens=max_tokens)
+        text = await groq_generate(prompt, max_tokens=max_tokens, temperature=temperature)
+        return text, "groq", DEFAULT_GROQ_MODEL, False
+    except Exception as exc:
+        if not is_rate_limit_error(exc):
+            raise
+        text = await gemini_generate(prompt, max_tokens=max_tokens)
+        return text, "gemini", DEFAULT_GEMINI_MODEL, True
 
-    except Exception as e:
-        error_msg = str(e)
 
-        # 🔥 Only fallback on rate limit (not all errors)
-        if "RATE_LIMIT" in error_msg:
-            print("[Fallback] Groq rate limited → switching to Gemini")
-
-            return await gemini_generate(
-                prompt,
-                max_tokens=max_tokens,
-            )
-
-        # Re-raise other errors (important for debugging)
-        raise
+async def generate_with_fallback(prompt: str, *, primary: str = "groq", max_tokens: int = 1024,
+                                 temperature: float = 0.2) -> str:
+    text, _, _, _ = await generate_with_details(
+        prompt, primary=primary, max_tokens=max_tokens, temperature=temperature,
+    )
+    return text
